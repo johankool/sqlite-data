@@ -81,7 +81,7 @@ class RemindersListsModel {
   func deleteTags(atOffsets offsets: IndexSet) {
     withErrorReporting {
       let tagTitles = offsets.map { tags[$0].title }
-      try database.write { db in
+      try database.writeWithUndoGroup("Delete tags") { db in
         try Tag
           .where { $0.title.in(tagTitles) }
           .delete()
@@ -121,7 +121,7 @@ class RemindersListsModel {
 
   func move(from source: IndexSet, to destination: Int) {
     withErrorReporting {
-      try database.write { db in
+      try database.writeWithUndoGroup("Reorder lists") { db in
         var ids = remindersLists.map(\.remindersList.id)
         ids.move(fromOffsets: source, toOffset: destination)
         try RemindersList
@@ -189,6 +189,7 @@ class RemindersListsModel {
 struct RemindersListsView: View {
   @Bindable var model: RemindersListsModel
   @Dependency(\.defaultSyncEngine) var syncEngine
+  @Dependency(\.defaultUndoManager) var undoManager
 
   var body: some View {
     List {
@@ -312,6 +313,30 @@ struct RemindersListsView: View {
     }
     .listStyle(.insetGrouped)
     .toolbar {
+      if let undoManager {
+        ToolbarItemGroup(placement: .navigationBarLeading) {
+          Button {
+            Task {
+              await withErrorReporting {
+                try await undoManager.undo()
+              }
+            }
+          } label: {
+            Image(systemName: "arrow.uturn.backward")
+          }
+          .disabled(!undoManager.canUndo)
+          Button {
+            Task {
+              await withErrorReporting {
+                try await undoManager.redo()
+              }
+            }
+          } label: {
+            Image(systemName: "arrow.uturn.forward")
+          }
+          .disabled(!undoManager.canRedo)
+        }
+      }
       #if DEBUG
         ToolbarItem(placement: .automatic) {
           Menu {

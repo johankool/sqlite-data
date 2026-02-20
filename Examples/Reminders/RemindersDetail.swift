@@ -50,7 +50,7 @@ class RemindersDetailModel: HashableObject {
 
   func move(from source: IndexSet, to destination: Int) async {
     withErrorReporting {
-      try database.write { db in
+      try database.writeWithUndoGroup("Reorder reminders") { db in
         var ids = reminderRows.map(\.reminder.id)
         ids.move(fromOffsets: source, toOffset: destination)
         try Reminder
@@ -178,6 +178,7 @@ struct RemindersDetailView: View {
 
   @State var isNavigationTitleVisible = false
   @State var navigationTitleHeight: CGFloat = 36
+  @Dependency(\.defaultUndoManager) var undoManager
 
   var body: some View {
     List {
@@ -244,6 +245,28 @@ struct RemindersDetailView: View {
       }
       ToolbarItem(placement: .primaryAction) {
         HStack(alignment: .firstTextBaseline) {
+          if let undoManager {
+            Button {
+              Task {
+                await withErrorReporting {
+                  try await undoManager.undo()
+                }
+              }
+            } label: {
+              Image(systemName: "arrow.uturn.backward")
+            }
+            .disabled(!undoManager.canUndo)
+            Button {
+              Task {
+                await withErrorReporting {
+                  try await undoManager.redo()
+                }
+              }
+            } label: {
+              Image(systemName: "arrow.uturn.forward")
+            }
+            .disabled(!undoManager.canRedo)
+          }
           if model.detailType.is(\.remindersList) {
             Button {
               Task { await model.shareButtonTapped() }
