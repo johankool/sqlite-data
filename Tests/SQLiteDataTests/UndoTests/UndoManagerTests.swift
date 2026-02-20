@@ -1,6 +1,9 @@
 import Foundation
 import SQLiteData
 import Testing
+#if canImport(CloudKit)
+  import CloudKit
+#endif
 
 // MARK: - Schema
 
@@ -112,23 +115,28 @@ extension DatabaseWriter where Self == DatabaseQueue {
     #expect(undoManager.undoStack.count == 1)
   }
 
-  // 5. Writes performed while _isSynchronizingChanges is true are not recorded.
-  @Test func syncExcluded() async throws {
+  // 5. Sync-origin writes can be grouped, undone, and carry synced-origin metadata.
+  @Test func syncIncludedWithMetadata() async throws {
     let db = try DatabaseQueue.undoDatabase()
     let undoManager = try UndoManager(for: db, tableNames: ["items"])
 
-    // Simulate a sync-engine write by setting the TaskLocal directly.
     try await $_isSynchronizingChanges.withValue(true) {
-      try await db.write { db in
+      try await undoManager.withGroup(
+        "Sync insert",
+        deviceID: UndoManager.syncDeviceID,
+        userRecordName: "collaborator-user"
+      ) { db in
         _ = try Item.insert { Item.Draft(title: "Sync item") }.execute(db)
       }
     }
 
-    #expect(!undoManager.canUndo)
-    #expect(undoManager.undoStack.isEmpty)
+    #expect(undoManager.canUndo)
+    #expect(undoManager.undoStack.first?.deviceID == UndoManager.syncDeviceID)
+    #expect(undoManager.undoStack.first?.userRecordName == "collaborator-user")
 
+    try await undoManager.undo()
     let items = try await db.read { try Item.fetchAll($0) }
-    #expect(items.count == 1)   // row IS in the database, just not undoable
+    #expect(items.isEmpty)
   }
 
   // 6. Inverse SQL executed during undo is not added to the undo stack; it goes to redo.
@@ -395,4 +403,28 @@ extension DatabaseWriter where Self == DatabaseQueue {
     }
     #expect(countAfterRedo == 0)
   }
+
+  #if canImport(CloudKit)
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    @Test func syncEngineWriteWrappedByUserDatabaseIsUndoable() async throws {
+      let db = try DatabaseQueue.undoDatabase()
+      let undoManager = try UndoManager(for: db, tableNames: ["items"])
+      let userDatabase = UserDatabase(database: db)
+      let zoneID = CKRecordZone.ID(zoneName: "shared-zone", ownerName: "collaborator-user")
+
+      try await $_currentZoneID.withValue(zoneID) {
+        try await userDatabase.write { db in
+          _ = try Item.insert { Item.Draft(title: "Synced item") }.execute(db)
+        }
+      }
+
+      #expect(undoManager.undoStack.count == 1)
+      #expect(undoManager.undoStack.first?.deviceID == UndoManager.syncDeviceID)
+      #expect(undoManager.undoStack.first?.userRecordName == zoneID.ownerName)
+
+      try await undoManager.undo()
+      let items = try await db.read { try Item.fetchAll($0) }
+      #expect(items.isEmpty)
+    }
+  #endif
 }

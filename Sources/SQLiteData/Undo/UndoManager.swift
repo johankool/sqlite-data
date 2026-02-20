@@ -17,8 +17,7 @@ import StructuredQueriesCore
 ///
 /// Create an `UndoManager` after the database is open, supplying the table names whose changes
 /// you want to track.  The manager installs lightweight SQLite triggers that record inverse SQL
-/// statements into a temporary log table.  Changes made by the CloudKit sync engine are
-/// automatically excluded.
+/// statements into a temporary log table.
 ///
 /// ```swift
 /// let undoManager = try UndoManager(
@@ -38,9 +37,18 @@ import StructuredQueriesCore
 ///
 /// ## CloudKit sync compatibility
 ///
-/// Changes written by a `SyncEngine` while `_isSynchronizingChanges` is `true` are silently
-/// skipped by the undo triggers, so they never appear on the undo stack.
+/// Changes written by a `SyncEngine` can be recorded as undo groups, including synced-origin
+/// metadata.
 public final class UndoManager: Perceptible, @unchecked Sendable {
+  private final class WeakUndoManager: @unchecked Sendable {
+    weak var value: UndoManager?
+    init(_ value: UndoManager) {
+      self.value = value
+    }
+  }
+
+  private static let _managersByID = LockIsolated([ObjectIdentifier: WeakUndoManager]())
+  package static let syncDeviceID = "sqlitedata-sync"
 
   // MARK: - Internal state
 
@@ -57,6 +65,7 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
 
   private let _state = LockIsolated(State())
   private let database: any DatabaseWriter
+  private let databaseID: ObjectIdentifier
   private let deviceID: String
   private let userRecordName: @Sendable () -> String?
   private let delegate: (any UndoManagerDelegate)?
@@ -119,6 +128,7 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     delegate: (any UndoManagerDelegate)? = nil
   ) throws {
     self.database = database
+    self.databaseID = ObjectIdentifier(database as AnyObject)
     self.deviceID = deviceID
     self.userRecordName = userRecordName
     self.delegate = delegate
@@ -137,6 +147,25 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
           try db.execute(sql: sql)
         }
       }
+    }
+
+    Self._managersByID.withValue {
+      $0[self.databaseID] = WeakUndoManager(self)
+    }
+  }
+
+  deinit {
+    Self._managersByID.withValue {
+      if $0[self.databaseID]?.value === self {
+        $0.removeValue(forKey: self.databaseID)
+      }
+    }
+  }
+
+  package static func manager(for database: any DatabaseWriter) -> UndoManager? {
+    _managersByID.withValue {
+      $0 = $0.filter { $0.value.value != nil }
+      return $0[ObjectIdentifier(database as AnyObject)]?.value
     }
   }
 
@@ -170,6 +199,8 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
   @discardableResult
   public func withGroup<T: Sendable>(
     _ description: String,
+    deviceID: String? = nil,
+    userRecordName: String? = nil,
     _ body: @Sendable (Database) throws -> T
   ) async throws -> T {
     let firstLog = _state.value.firstLog
@@ -190,8 +221,52 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
 
     let group = UndoGroup(
       description: description,
-      deviceID: deviceID,
-      userRecordName: userRecordName(),
+      deviceID: deviceID ?? self.deviceID,
+      userRecordName: userRecordName ?? self.userRecordName(),
+      date: Date()
+    )
+    let entry = UndoEntry(begin: firstLog, end: maxSeq, group: group)
+
+    _$perceptionRegistrar.withMutation(of: self, keyPath: \.undoStack) {
+      _$perceptionRegistrar.withMutation(of: self, keyPath: \.redoStack) {
+        _state.withValue {
+          guard $0.freezePoint < 0 else { return }
+          $0.undoEntries.append(entry)
+          $0.redoEntries = []
+          $0.firstLog = maxSeq + 1
+        }
+      }
+    }
+
+    return result
+  }
+
+  /// Synchronous variant of ``withGroup(_:deviceID:userRecordName:_:)``.
+  @discardableResult
+  public func withGroup<T>(
+    _ description: String,
+    deviceID: String? = nil,
+    userRecordName: String? = nil,
+    _ body: (Database) throws -> T
+  ) throws -> T {
+    let firstLog = _state.value.firstLog
+
+    let result = try database.write { db in
+      try body(db)
+    }
+
+    let maxSeq = try database.write { db in
+      try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
+    }
+
+    guard maxSeq >= firstLog else {
+      return result
+    }
+
+    let group = UndoGroup(
+      description: description,
+      deviceID: deviceID ?? self.deviceID,
+      userRecordName: userRecordName ?? self.userRecordName(),
       date: Date()
     )
     let entry = UndoEntry(begin: firstLog, end: maxSeq, group: group)
