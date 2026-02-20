@@ -19,7 +19,11 @@
     package func write<T: Sendable>(
       _ updates: @Sendable (Database) throws -> T
     ) async throws -> T {
-      if let undoManager = UndoManager.manager(for: database) {
+      @Dependency(\.defaultUndoManager) var defaultUndoManager
+      let undoManager =
+        (defaultUndoManager?.manages(database: database) == true ? defaultUndoManager : nil)
+        ?? UndoManager.manager(for: database)
+      if let undoManager {
         return try await undoManager.withGroup(
           "Sync iCloud changes",
           deviceID: UndoManager.syncDeviceID,
@@ -49,7 +53,11 @@
     package func write<T>(
       _ updates: (Database) throws -> T
     ) throws -> T {
-      if let undoManager = UndoManager.manager(for: database) {
+      @Dependency(\.defaultUndoManager) var defaultUndoManager
+      let undoManager =
+        (defaultUndoManager?.manages(database: database) == true ? defaultUndoManager : nil)
+        ?? UndoManager.manager(for: database)
+      if let undoManager {
         return try undoManager.withGroup(
           "Sync iCloud changes",
           deviceID: UndoManager.syncDeviceID,

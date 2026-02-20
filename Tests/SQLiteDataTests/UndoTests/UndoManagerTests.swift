@@ -1,4 +1,5 @@
 import Foundation
+import Dependencies
 import SQLiteData
 import Testing
 #if canImport(CloudKit)
@@ -37,6 +38,11 @@ extension DatabaseWriter where Self == DatabaseQueue {
 // MARK: - Tests
 
 @Suite struct UndoManagerTests {
+  @Test func defaultUndoManagerDependencyDefaultsToNil() {
+    @Dependency(\.defaultUndoManager) var defaultUndoManager
+    #expect(defaultUndoManager == nil)
+  }
+
 
   // 1. Basic undo removes the inserted row and leaves canUndo false.
   @Test func basicUndo() async throws {
@@ -425,6 +431,26 @@ extension DatabaseWriter where Self == DatabaseQueue {
       try await undoManager.undo()
       let items = try await db.read { try Item.fetchAll($0) }
       #expect(items.isEmpty)
+    }
+
+    @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
+    @Test func syncEngineWriteWithoutUndoManagerStillWorks() async throws {
+      try await withDependencies {
+        $0.defaultUndoManager = nil
+      } operation: {
+        let db = try DatabaseQueue.undoDatabase()
+        let userDatabase = UserDatabase(database: db)
+        let zoneID = CKRecordZone.ID(zoneName: "shared-zone", ownerName: "collaborator-user")
+
+        try await $_currentZoneID.withValue(zoneID) {
+          try await userDatabase.write { db in
+            _ = try Item.insert { Item.Draft(title: "Synced item") }.execute(db)
+          }
+        }
+
+        let items = try await db.read { try Item.fetchAll($0) }
+        #expect(items.count == 1)
+      }
     }
   #endif
 }

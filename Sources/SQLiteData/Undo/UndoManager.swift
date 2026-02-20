@@ -169,6 +169,10 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     }
   }
 
+  package func manages(database: any DatabaseWriter) -> Bool {
+    databaseID == ObjectIdentifier(database as AnyObject)
+  }
+
   // MARK: - Static helpers
 
   /// A device identifier suitable for use with ``init(for:tableNames:deviceID:userRecordName:delegate:)``.
