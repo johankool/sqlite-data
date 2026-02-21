@@ -111,7 +111,7 @@ final class RemindersUndoManagerDelegate: UndoManagerDelegate {
 
     private var originDescription: String {
       var parts: [String] = []
-      if group.deviceID != UndoManager.defaultDeviceID {
+      if group.deviceID != SQLiteUndoManager.defaultDeviceID {
         if group.deviceID == "sqlitedata-sync" {
           parts.append("another device")
         } else {
@@ -152,7 +152,7 @@ final class RemindersUndoManagerDelegate: UndoManagerDelegate {
   }
 
   private func shouldConfirm(for group: UndoGroup) -> Bool {
-    let isOtherDevice = group.deviceID != UndoManager.defaultDeviceID
+    let isOtherDevice = group.deviceID != SQLiteUndoManager.defaultDeviceID
     let isOtherUser = group.userRecordName != nil
     return isOtherDevice || isOtherUser
   }

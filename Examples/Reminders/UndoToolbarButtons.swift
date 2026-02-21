@@ -3,6 +3,7 @@ import SwiftUI
 
 struct UndoToolbarButtons: View {
   @Dependency(\.defaultUndoManager) private var undoManager
+  @Environment(\.undoManager) private var foundationUndoManager
 
   var body: some View {
     if let undoManager {
@@ -40,6 +41,9 @@ struct UndoToolbarButtons: View {
             }
           }
         }
+      }
+      .onAppear {
+        undoManager.bind(to: foundationUndoManager)
       }
     }
   }

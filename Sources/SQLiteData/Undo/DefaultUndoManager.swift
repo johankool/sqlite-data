@@ -1,7 +1,7 @@
 import Dependencies
 
 extension DependencyValues {
-  /// The default undo manager used by SQLiteData integrations when available.
+  /// The default SQLiteData undo manager used by integrations when available.
   ///
   /// Configure this as early as possible in your app's lifetime, for example with
   /// `prepareDependencies`:

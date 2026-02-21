@@ -15,6 +15,8 @@ import StructuredQueriesCore
 
 /// Tracks changes made to a SQLite database and lets you undo and redo them.
 ///
+/// Prefer ``SQLiteUndoManager`` in your code when you also work with `Foundation.UndoManager`.
+///
 /// Create an `UndoManager` after the database is open, supplying the table names whose changes
 /// you want to track.  The manager installs lightweight SQLite triggers that record inverse SQL
 /// statements into a temporary log table.
@@ -69,6 +71,9 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
   private let deviceID: String
   private let userRecordName: @Sendable () -> String?
   private let delegate: (any UndoManagerDelegate)?
+  #if canImport(ObjectiveC)
+    private weak var foundationUndoManager: Foundation.UndoManager?
+  #endif
 
   // MARK: - Observable conformance (Perception)
 
@@ -176,6 +181,16 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     databaseID == ObjectIdentifier(database as AnyObject)
   }
 
+  #if canImport(ObjectiveC)
+    /// Binds this manager to Foundation's undo manager for seamless system undo/redo integration.
+    ///
+    /// When bound, SQLiteData undo/redo operations are registered with the Foundation manager so
+    /// keyboard shortcuts and responder-chain undo work with the same stack.
+    public func bind(to foundationUndoManager: Foundation.UndoManager?) {
+      self.foundationUndoManager = foundationUndoManager
+    }
+  #endif
+
   // MARK: - Static helpers
 
   /// A device identifier suitable for use with ``init(for:tables:deviceID:userRecordName:delegate:)``.
@@ -244,6 +259,9 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
         }
       }
     }
+    if _state.withValue({ $0.freezePoint < 0 }) {
+      registerFoundationAction(.undo, group: group)
+    }
 
     return result
   }
@@ -287,6 +305,9 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
           $0.firstLog = maxSeq + 1
         }
       }
+    }
+    if _state.withValue({ $0.freezePoint < 0 }) {
+      registerFoundationAction(.undo, group: group)
     }
 
     return result
@@ -400,6 +421,7 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     let newEnd = try await database.write { db in
       try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
     }
+    let didAppend = newEnd >= firstLog
 
     let newEntry = UndoEntry(begin: firstLog, end: newEnd, group: entry.group)
 
@@ -409,12 +431,12 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
           switch action {
           case .undo:
             state.undoEntries.removeLast()
-            if newEnd >= firstLog {
+            if didAppend {
               state.redoEntries.append(newEntry)
             }
           case .redo:
             state.redoEntries.removeLast()
-            if newEnd >= firstLog {
+            if didAppend {
               state.undoEntries.append(newEntry)
             }
           }
@@ -422,7 +444,41 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
         }
       }
     }
+
+    guard didAppend else { return }
+    switch action {
+    case .undo:
+      registerFoundationAction(.redo, group: entry.group)
+    case .redo:
+      registerFoundationAction(.undo, group: entry.group)
+    }
   }
+
+  #if canImport(ObjectiveC)
+    private func registerFoundationAction(_ action: UndoAction, group: UndoGroup) {
+      guard let foundationUndoManager else { return }
+      Task { @MainActor [weak foundationUndoManager] in
+        guard let foundationUndoManager else { return }
+        foundationUndoManager.registerUndo(withTarget: self) { target in
+          Task {
+            do {
+              switch action {
+              case .undo:
+                try await target.undo()
+              case .redo:
+                try await target.redo()
+              }
+            } catch {
+              assertionFailure("SQLiteUndoManager failed to perform Foundation undo action: \(error)")
+            }
+          }
+        }
+        foundationUndoManager.setActionName(group.description)
+      }
+    }
+  #else
+    private func registerFoundationAction(_ action: UndoAction, group: UndoGroup) {}
+  #endif
 }
 
 #if canImport(Observation)
