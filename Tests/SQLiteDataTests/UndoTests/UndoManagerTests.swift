@@ -415,6 +415,82 @@ extension DatabaseWriter where Self == DatabaseQueue {
     #expect(countAfterRedo == 0)
   }
 
+  #if canImport(ObjectiveC)
+    @Test func foundationUndoBridgeRoundTrip() async throws {
+      let db = try DatabaseQueue.undoDatabase()
+      let sqliteUndoManager = try SQLiteUndoManager(for: db, tables: Item.self)
+      let foundationUndoManager = await MainActor.run { Foundation.UndoManager() }
+      sqliteUndoManager.bind(to: foundationUndoManager)
+
+      try await sqliteUndoManager.withGroup("Insert via bridge") { db in
+        _ = try Item.insert { Item.Draft(title: "Hello") }.execute(db)
+      }
+
+      try await waitUntil {
+        await MainActor.run { foundationUndoManager.canUndo }
+      }
+      #expect(await MainActor.run { foundationUndoManager.canUndo })
+
+      await MainActor.run { foundationUndoManager.undo() }
+
+      try await waitUntil {
+        let count = try await db.read { db in
+          try Int.fetchOne(db, sql: #"SELECT COUNT(*) FROM "items""#) ?? 0
+        }
+        return count == 0 && sqliteUndoManager.canRedo
+      }
+
+      let countAfterUndo = try await db.read { db in
+        try Int.fetchOne(db, sql: #"SELECT COUNT(*) FROM "items""#) ?? 0
+      }
+      #expect(countAfterUndo == 0)
+      #expect(sqliteUndoManager.canRedo)
+      #expect(await MainActor.run { foundationUndoManager.canRedo })
+
+      await MainActor.run { foundationUndoManager.redo() }
+
+      try await waitUntil {
+        let count = try await db.read { db in
+          try Int.fetchOne(db, sql: #"SELECT COUNT(*) FROM "items""#) ?? 0
+        }
+        return count == 1 && sqliteUndoManager.canUndo
+      }
+
+      let countAfterRedo = try await db.read { db in
+        try Int.fetchOne(db, sql: #"SELECT COUNT(*) FROM "items""#) ?? 0
+      }
+      #expect(countAfterRedo == 1)
+      #expect(sqliteUndoManager.canUndo)
+    }
+
+    @Test func foundationUndoBridgeUnboundFallback() async throws {
+      let db = try DatabaseQueue.undoDatabase()
+      let sqliteUndoManager = try SQLiteUndoManager(for: db, tables: Item.self)
+      let foundationUndoManager = await MainActor.run { Foundation.UndoManager() }
+
+      try await sqliteUndoManager.withGroup("Standalone insert") { db in
+        _ = try Item.insert { Item.Draft(title: "Hello") }.execute(db)
+      }
+
+      try await Task.sleep(nanoseconds: 50_000_000)
+
+      #expect(sqliteUndoManager.canUndo)
+      #expect(!(await MainActor.run { foundationUndoManager.canUndo }))
+    }
+
+    private func waitUntil(
+      _ condition: @escaping @Sendable () async throws -> Bool
+    ) async throws {
+      for _ in 0..<200 {
+        if try await condition() {
+          return
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+      }
+      #expect(Bool(false))
+    }
+  #endif
+
   #if canImport(CloudKit)
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     @Test func syncEngineWriteWrappedByUserDatabaseIsUndoable() async throws {

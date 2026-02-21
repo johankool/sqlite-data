@@ -446,35 +446,40 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     }
 
     guard didAppend else { return }
-    switch action {
-    case .undo:
-      registerFoundationAction(.redo, group: entry.group)
-    case .redo:
-      registerFoundationAction(.undo, group: entry.group)
-    }
   }
 
   #if canImport(ObjectiveC)
     private func registerFoundationAction(_ action: UndoAction, group: UndoGroup) {
+      Task { @MainActor [weak self] in
+        guard let self else { return }
+        self.registerFoundationActionOnMain(action, group: group)
+      }
+    }
+
+    @MainActor
+    private func registerFoundationActionOnMain(_ action: UndoAction, group: UndoGroup) {
       guard let foundationUndoManager else { return }
-      Task { @MainActor [weak foundationUndoManager] in
-        guard let foundationUndoManager else { return }
-        foundationUndoManager.registerUndo(withTarget: self) { target in
-          Task {
-            do {
-              switch action {
-              case .undo:
-                try await target.undo()
-              case .redo:
-                try await target.redo()
-              }
-            } catch {
-              assertionFailure("SQLiteUndoManager failed to perform Foundation undo action: \(error)")
+      foundationUndoManager.registerUndo(withTarget: self) { target in
+        let inverseAction: UndoAction
+        switch action {
+        case .undo: inverseAction = .redo
+        case .redo: inverseAction = .undo
+        }
+        target.registerFoundationActionOnMain(inverseAction, group: group)
+        Task {
+          do {
+            switch action {
+            case .undo:
+              try await target.undo()
+            case .redo:
+              try await target.redo()
             }
+          } catch {
+            assertionFailure("SQLiteUndoManager failed to perform Foundation undo action: \(error)")
           }
         }
-        foundationUndoManager.setActionName(group.description)
       }
+      foundationUndoManager.setActionName(group.description)
     }
   #else
     private func registerFoundationAction(_ action: UndoAction, group: UndoGroup) {}
