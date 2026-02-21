@@ -189,7 +189,6 @@ class RemindersListsModel {
 struct RemindersListsView: View {
   @Bindable var model: RemindersListsModel
   @Dependency(\.defaultSyncEngine) var syncEngine
-  @Dependency(\.defaultUndoManager) var undoManager
 
   var body: some View {
     List {
@@ -313,29 +312,8 @@ struct RemindersListsView: View {
     }
     .listStyle(.insetGrouped)
     .toolbar {
-      if let undoManager {
-        ToolbarItemGroup(placement: .navigationBarLeading) {
-          Button {
-            Task {
-              await withErrorReporting {
-                try await undoManager.undo()
-              }
-            }
-          } label: {
-            Image(systemName: "arrow.uturn.backward")
-          }
-          .disabled(!undoManager.canUndo)
-          Button {
-            Task {
-              await withErrorReporting {
-                try await undoManager.redo()
-              }
-            }
-          } label: {
-            Image(systemName: "arrow.uturn.forward")
-          }
-          .disabled(!undoManager.canRedo)
-        }
+      ToolbarItemGroup(placement: .navigationBarLeading) {
+        UndoToolbarButtons()
       }
       #if DEBUG
         ToolbarItem(placement: .automatic) {

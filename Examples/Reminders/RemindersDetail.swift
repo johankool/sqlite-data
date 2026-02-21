@@ -178,7 +178,6 @@ struct RemindersDetailView: View {
 
   @State var isNavigationTitleVisible = false
   @State var navigationTitleHeight: CGFloat = 36
-  @Dependency(\.defaultUndoManager) var undoManager
 
   var body: some View {
     List {
@@ -245,28 +244,7 @@ struct RemindersDetailView: View {
       }
       ToolbarItem(placement: .primaryAction) {
         HStack(alignment: .firstTextBaseline) {
-          if let undoManager {
-            Button {
-              Task {
-                await withErrorReporting {
-                  try await undoManager.undo()
-                }
-              }
-            } label: {
-              Image(systemName: "arrow.uturn.backward")
-            }
-            .disabled(!undoManager.canUndo)
-            Button {
-              Task {
-                await withErrorReporting {
-                  try await undoManager.redo()
-                }
-              }
-            } label: {
-              Image(systemName: "arrow.uturn.forward")
-            }
-            .disabled(!undoManager.canRedo)
-          }
+          UndoToolbarButtons()
           if model.detailType.is(\.remindersList) {
             Button {
               Task { await model.shareButtonTapped() }
