@@ -33,6 +33,7 @@ struct RemindersApp: App {
         NavigationStack {
           RemindersListsView(model: Self.model)
         }
+        .bindSQLiteUndoManagerToSystemUndo()
         .alert(
           "Reset local data?",
           isPresented: $syncEngineDelegate.isDeleteLocalDataAlertPresented

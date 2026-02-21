@@ -1,49 +1,51 @@
 import SQLiteData
 import SwiftUI
 
-struct UndoToolbarButtons: View {
+struct UndoMenuItems: View {
   @Dependency(\.defaultUndoManager) private var undoManager
-  @Environment(\.undoManager) private var foundationUndoManager
 
   var body: some View {
     if let undoManager {
-      Button {
-        performUndo()
-      } label: {
-        Image(systemName: "arrow.uturn.backward")
+      ControlGroup {
+        Button {
+          performUndo()
+        } label: {
+          Label("Undo", systemImage: "arrow.uturn.backward")
+        }
+        .disabled(!undoManager.canUndo)
+        
+        Button {
+          performRedo()
+        } label: {
+          Label("Redo", systemImage: "arrow.uturn.forward")
+        }
+        .disabled(!undoManager.canRedo)
+        
       }
-      .disabled(!undoManager.canUndo)
-      .contextMenu {
-        if undoManager.undoStack.isEmpty {
-          Text("No actions to undo")
-        } else {
+      .controlGroupStyle(.menu)
+      
+      if !undoManager.undoStack.isEmpty {
+        Menu {
           ForEach(undoManager.undoStack) { group in
             Button("Undo \(group.description)") {
               performUndo(to: group)
             }
           }
+        } label: {
+          Label("Undo", systemImage: "arrow.uturn.backward.square")
         }
       }
-
-      Button {
-        performRedo()
-      } label: {
-        Image(systemName: "arrow.uturn.forward")
-      }
-      .disabled(!undoManager.canRedo)
-      .contextMenu {
-        if undoManager.redoStack.isEmpty {
-          Text("No actions to redo")
-        } else {
+      
+      if !undoManager.redoStack.isEmpty {
+        Menu {
           ForEach(undoManager.redoStack) { group in
             Button("Redo \(group.description)") {
               performRedo(to: group)
             }
           }
+        } label: {
+          Label("Redo", systemImage: "arrow.uturn.forward.square")
         }
-      }
-      .onAppear {
-        undoManager.bind(to: foundationUndoManager)
       }
     }
   }
@@ -93,5 +95,23 @@ struct UndoToolbarButtons: View {
         }
       }
     }
+  }
+}
+
+struct BindSQLiteUndoManagerToSystemUndo: ViewModifier {
+  @Dependency(\.defaultUndoManager) private var sqliteUndoManager
+  @Environment(\.undoManager) private var foundationUndoManager
+
+  func body(content: Content) -> some View {
+    content
+      .task(id: foundationUndoManager.map(ObjectIdentifier.init)) {
+        sqliteUndoManager?.bind(to: foundationUndoManager)
+      }
+  }
+}
+
+extension View {
+  func bindSQLiteUndoManagerToSystemUndo() -> some View {
+    modifier(BindSQLiteUndoManagerToSystemUndo())
   }
 }

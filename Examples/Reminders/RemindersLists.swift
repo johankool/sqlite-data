@@ -55,6 +55,10 @@ class RemindersListsModel {
 
   @ObservationIgnored
   @Dependency(\.defaultDatabase) private var database
+  @ObservationIgnored
+  @Dependency(\.defaultUndoManager) private var undoManager
+  @ObservationIgnored
+  private var undoEventsTask: Task<Void, Never>?
 
   func statTapped(_ detailType: RemindersDetailModel.DetailType) {
     destination = .detail(RemindersDetailModel(detailType: detailType))
@@ -91,6 +95,7 @@ class RemindersListsModel {
   }
 
   func onAppear() {
+    observeUndoEventsIfNeeded()
     withErrorReporting {
       try Tips.configure()
     }
@@ -148,6 +153,36 @@ class RemindersListsModel {
       }
     }
   #endif
+
+  deinit {
+    undoEventsTask?.cancel()
+  }
+
+  private func observeUndoEventsIfNeeded() {
+    guard undoEventsTask == nil, let undoManager else { return }
+    undoEventsTask = Task { [weak self] in
+      guard let self else { return }
+      for await event in undoManager.events {
+        await self.handleUndoEvent(event)
+      }
+    }
+  }
+
+  private func handleUndoEvent(_ event: UndoEvent) async {
+    guard event.kind == .undo else { return }
+    guard event.affectedRows.contains(where: { $0.tableName == RemindersList.tableName }) else { return }
+    guard case let .detail(detailModel)? = destination else { return }
+    guard case let .remindersList(remindersList) = detailModel.detailType else { return }
+
+    await withErrorReporting {
+      let isStillPresent = try await database.read { db in
+        try RemindersList.find(remindersList.id).fetchOne(db) != nil
+      }
+      if !isStillPresent {
+        destination = nil
+      }
+    }
+  }
 
   @CasePathable
   enum Destination {
@@ -312,12 +347,11 @@ struct RemindersListsView: View {
     }
     .listStyle(.insetGrouped)
     .toolbar {
-      ToolbarItemGroup(placement: .navigationBarLeading) {
-        UndoToolbarButtons()
-      }
-      #if DEBUG
-        ToolbarItem(placement: .automatic) {
-          Menu {
+      ToolbarItem(placement: .primaryAction) {
+        Menu {
+          UndoMenuItems()
+          #if DEBUG
+            Divider()
             Button {
               model.seedDatabaseButtonTapped()
             } label: {
@@ -338,12 +372,12 @@ struct RemindersListsView: View {
               Text("\(syncEngine.isRunning ? "Stop" : "Start") synchronizing")
               Image(systemName: syncEngine.isRunning ? "stop" : "play")
             }
-          } label: {
-            Image(systemName: "ellipsis.circle")
-          }
-          .popoverTip(model.seedDatabaseTip)
+          #endif
+        } label: {
+          Image(systemName: "ellipsis.circle")
         }
-      #endif
+        .popoverTip(model.seedDatabaseTip)
+      }
       ToolbarItem(placement: .bottomBar) {
         HStack {
           Button {

@@ -244,7 +244,6 @@ struct RemindersDetailView: View {
       }
       ToolbarItem(placement: .primaryAction) {
         HStack(alignment: .firstTextBaseline) {
-          UndoToolbarButtons()
           if model.detailType.is(\.remindersList) {
             Button {
               Task { await model.shareButtonTapped() }
@@ -253,6 +252,9 @@ struct RemindersDetailView: View {
             }
           }
           Menu {
+            UndoMenuItems()
+              .tint(model.detailType.color)
+            Divider()
             Group {
               Menu {
                 ForEach(RemindersDetailModel.Ordering.allCases, id: \.self) { ordering in
