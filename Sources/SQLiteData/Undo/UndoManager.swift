@@ -1,6 +1,7 @@
 import ConcurrencyExtras
 import Foundation
 import GRDB
+import IssueReporting
 import Perception
 #if canImport(Observation)
   import Observation
@@ -57,6 +58,7 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
   private struct State {
     var undoEntries: [UndoEntry] = []
     var redoEntries: [UndoEntry] = []
+    var activeBarrier: (id: UUID, barrier: OpenBarrier)?
     /// The next `seq` value that will begin a new undo group.
     var firstLog: Int = 1
     /// The first log sequence captured by the outermost freeze.
@@ -65,12 +67,25 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     var freezeDepth: Int = 0
   }
 
+  private struct OpenBarrier: Sendable {
+    var group: UndoGroup
+    var firstLog: Int
+  }
+
+  public enum BarrierError: Error {
+    case alreadyOpen
+    case notFound
+  }
+
   private let _state = LockIsolated(State())
   private let database: any DatabaseWriter
   private let databaseID: ObjectIdentifier
   private let deviceID: String
   private let userRecordName: @Sendable () -> String?
+  private let trackedTableNames: Set<String>
   private let delegate: (any UndoManagerDelegate)?
+  private let eventsContinuation: AsyncStream<UndoEvent>.Continuation
+  public let events: AsyncStream<UndoEvent>
   #if canImport(ObjectiveC)
     private weak var foundationUndoManager: Foundation.UndoManager?
   #endif
@@ -134,16 +149,23 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     userRecordName: @Sendable @escaping () -> String? = { nil },
     delegate: (any UndoManagerDelegate)? = nil
   ) throws {
+    var trackedTableNames = Set<String>()
+    for table in repeat each tables {
+      trackedTableNames.insert(table.tableName)
+    }
+    (self.events, self.eventsContinuation) = AsyncStream.makeStream()
     self.database = database
     self.databaseID = ObjectIdentifier(database as AnyObject)
     self.deviceID = deviceID
     self.userRecordName = userRecordName
     self.delegate = delegate
+    self.trackedTableNames = trackedTableNames
 
     // One-time setup on the writer connection: register the custom function,
     // create the temp log table, and install triggers for each observed table.
     try database.write { db in
       db.add(function: $_shouldRecord)
+      db.add(function: $_isReplaying)
 
       try db.execute(sql: undoLogTableSQL)
 
@@ -204,7 +226,138 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     #endif
   }
 
+  /// A SQL expression that reports whether undo/redo replay is currently executing.
+  ///
+  /// Use this in application trigger `WHEN` clauses to suppress side-effect writes during replay.
+  public static func isReplaying() -> some QueryExpression<Bool> {
+    $_isReplaying()
+  }
+
   // MARK: - Group recording
+
+  /// Begins recording a barrier that can later be ended or cancelled.
+  ///
+  /// Use this API when an undoable action spans multiple writes or async boundaries.
+  @discardableResult
+  public func beginBarrier(
+    _ description: String,
+    deviceID: String? = nil,
+    userRecordName: String? = nil
+  ) throws -> UUID {
+    let group = UndoGroup(
+      description: description,
+      deviceID: deviceID ?? self.deviceID,
+      userRecordName: userRecordName ?? self.userRecordName(),
+      date: Date()
+    )
+    let barrierID = UUID()
+    try _state.withValue { state in
+      guard state.activeBarrier == nil else { throw BarrierError.alreadyOpen }
+      state.activeBarrier = (
+        id: barrierID,
+        barrier: OpenBarrier(group: group, firstLog: state.firstLog)
+      )
+    }
+    return barrierID
+  }
+
+  /// Ends a previously opened barrier and pushes it to undo history if changes were recorded.
+  @discardableResult
+  public func endBarrier(_ barrierID: UUID) throws -> UndoGroup? {
+    let barrier = try _state.withValue { state -> OpenBarrier in
+      guard let activeBarrier = state.activeBarrier, activeBarrier.id == barrierID else {
+        throw BarrierError.notFound
+      }
+      state.activeBarrier = nil
+      return activeBarrier.barrier
+    }
+    let summary = try database.write { db -> (maxSeq: Int, modifiedTables: Set<String>)? in
+      guard var maxSeq = try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq,
+        maxSeq >= barrier.firstLog
+      else {
+        return nil
+      }
+      try undoReconcileEntries(in: db, from: barrier.firstLog, to: maxSeq)
+      maxSeq = try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
+      guard maxSeq >= barrier.firstLog else { return nil }
+      return (maxSeq, try undoModifiedTableNames(in: db, from: barrier.firstLog, to: maxSeq))
+    }
+    guard let summary else { return nil }
+    return finalizeBarrier(
+      barrier,
+      maxSeq: summary.maxSeq,
+      modifiedTables: summary.modifiedTables
+    )
+  }
+
+  /// Async variant of ``endBarrier(_:)``.
+  @discardableResult
+  public func endBarrier(_ barrierID: UUID) async throws -> UndoGroup? {
+    let barrier = try _state.withValue { state -> OpenBarrier in
+      guard let activeBarrier = state.activeBarrier, activeBarrier.id == barrierID else {
+        throw BarrierError.notFound
+      }
+      state.activeBarrier = nil
+      return activeBarrier.barrier
+    }
+    let summary = try await database.write { db -> (maxSeq: Int, modifiedTables: Set<String>)? in
+      guard var maxSeq = try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq,
+        maxSeq >= barrier.firstLog
+      else {
+        return nil
+      }
+      try undoReconcileEntries(in: db, from: barrier.firstLog, to: maxSeq)
+      maxSeq = try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
+      guard maxSeq >= barrier.firstLog else { return nil }
+      return (maxSeq, try undoModifiedTableNames(in: db, from: barrier.firstLog, to: maxSeq))
+    }
+    guard let summary else { return nil }
+    return finalizeBarrier(
+      barrier,
+      maxSeq: summary.maxSeq,
+      modifiedTables: summary.modifiedTables
+    )
+  }
+
+  /// Cancels a previously opened barrier and discards any undo log entries captured for it.
+  public func cancelBarrier(_ barrierID: UUID) throws {
+    let barrier = try _state.withValue { state -> OpenBarrier in
+      guard let activeBarrier = state.activeBarrier, activeBarrier.id == barrierID else {
+        throw BarrierError.notFound
+      }
+      state.activeBarrier = nil
+      return activeBarrier.barrier
+    }
+    try database.write { db in
+      try UndoLog
+        .where { $0.seq >= barrier.firstLog }
+        .delete()
+        .execute(db)
+    }
+    _state.withValue { state in
+      state.firstLog = barrier.firstLog
+    }
+  }
+
+  /// Async variant of ``cancelBarrier(_:)``.
+  public func cancelBarrier(_ barrierID: UUID) async throws {
+    let barrier = try _state.withValue { state -> OpenBarrier in
+      guard let activeBarrier = state.activeBarrier, activeBarrier.id == barrierID else {
+        throw BarrierError.notFound
+      }
+      state.activeBarrier = nil
+      return activeBarrier.barrier
+    }
+    try await database.write { db in
+      try UndoLog
+        .where { $0.seq >= barrier.firstLog }
+        .delete()
+        .execute(db)
+    }
+    _state.withValue { state in
+      state.firstLog = barrier.firstLog
+    }
+  }
 
   /// Performs `body` inside a database write transaction and records all changes as a named
   /// undo group.
@@ -225,45 +378,21 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     userRecordName: String? = nil,
     _ body: @Sendable (Database) throws -> T
   ) async throws -> T {
-    let firstLog = _state.value.firstLog
-
-    let result = try await database.write { db in
-      try body(db)
-    }
-
-    // Determine whether any new rows were inserted into the log.
-    let maxSeq = try await database.write { db in
-      try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
-    }
-
-    guard maxSeq >= firstLog else {
-      // No new entries; the write was a no-op or recording is suppressed.
-      return result
-    }
-
-    let group = UndoGroup(
-      description: description,
-      deviceID: deviceID ?? self.deviceID,
-      userRecordName: userRecordName ?? self.userRecordName(),
-      date: Date()
+    let barrierID = try beginBarrier(
+      description,
+      deviceID: deviceID,
+      userRecordName: userRecordName
     )
-    let entry = UndoEntry(begin: firstLog, end: maxSeq, group: group)
-
-    _$perceptionRegistrar.withMutation(of: self, keyPath: \.undoStack) {
-      _$perceptionRegistrar.withMutation(of: self, keyPath: \.redoStack) {
-        _state.withValue {
-          guard $0.freezePoint < 0 else { return }
-          $0.undoEntries.append(entry)
-          $0.redoEntries = []
-          $0.firstLog = maxSeq + 1
-        }
+    do {
+      let result = try await database.write { db in
+        try body(db)
       }
+      _ = try await endBarrier(barrierID)
+      return result
+    } catch {
+      try await cancelBarrier(barrierID)
+      throw error
     }
-    if _state.withValue({ $0.freezePoint < 0 }) {
-      registerFoundationAction(.undo, group: group)
-    }
-
-    return result
   }
 
   /// Synchronous variant of ``withGroup(_:deviceID:userRecordName:_:)``.
@@ -274,43 +403,21 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     userRecordName: String? = nil,
     _ body: (Database) throws -> T
   ) throws -> T {
-    let firstLog = _state.value.firstLog
-
-    let result = try database.write { db in
-      try body(db)
-    }
-
-    let maxSeq = try database.write { db in
-      try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
-    }
-
-    guard maxSeq >= firstLog else {
-      return result
-    }
-
-    let group = UndoGroup(
-      description: description,
-      deviceID: deviceID ?? self.deviceID,
-      userRecordName: userRecordName ?? self.userRecordName(),
-      date: Date()
+    let barrierID = try beginBarrier(
+      description,
+      deviceID: deviceID,
+      userRecordName: userRecordName
     )
-    let entry = UndoEntry(begin: firstLog, end: maxSeq, group: group)
-
-    _$perceptionRegistrar.withMutation(of: self, keyPath: \.undoStack) {
-      _$perceptionRegistrar.withMutation(of: self, keyPath: \.redoStack) {
-        _state.withValue {
-          guard $0.freezePoint < 0 else { return }
-          $0.undoEntries.append(entry)
-          $0.redoEntries = []
-          $0.firstLog = maxSeq + 1
-        }
+    do {
+      let result = try database.write { db in
+        try body(db)
       }
+      _ = try endBarrier(barrierID)
+      return result
+    } catch {
+      try cancelBarrier(barrierID)
+      throw error
     }
-    if _state.withValue({ $0.freezePoint < 0 }) {
-      registerFoundationAction(.undo, group: group)
-    }
-
-    return result
   }
 
   // MARK: - Undo / Redo
@@ -371,6 +478,43 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
 
   // MARK: - Private helpers
 
+  private func finalizeBarrier(
+    _ barrier: OpenBarrier,
+    maxSeq: Int,
+    modifiedTables: Set<String>
+  ) -> UndoGroup? {
+    guard maxSeq >= barrier.firstLog else {
+      return nil
+    }
+    let unknownTables = modifiedTables.subtracting(trackedTableNames)
+    if !unknownTables.isEmpty {
+      reportIssue(
+        """
+        Undo group '\(barrier.group.description)' recorded changes for unexpected tables: \
+        \(unknownTables.sorted().joined(separator: ", ")).
+        """
+      )
+    }
+    let entry = UndoEntry(begin: barrier.firstLog, end: maxSeq, group: barrier.group)
+    let shouldRecord = _state.withValue { $0.freezePoint < 0 }
+    _$perceptionRegistrar.withMutation(of: self, keyPath: \.undoStack) {
+      _$perceptionRegistrar.withMutation(of: self, keyPath: \.redoStack) {
+        _state.withValue { state in
+          if shouldRecord {
+            state.undoEntries.append(entry)
+            state.redoEntries = []
+            state.firstLog = maxSeq + 1
+          }
+        }
+      }
+    }
+    if shouldRecord {
+      registerFoundationAction(.undo, group: barrier.group)
+      return barrier.group
+    }
+    return nil
+  }
+
   private func perform(_ action: UndoAction) async throws {
     // Peek at the entry to pass to the delegate.
     let entry: UndoEntry? = _state.withValue { state in
@@ -398,28 +542,42 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
 
     // Execute inverse SQL inside a write transaction.
     // Triggers must run so that inverse-of-inverse statements are recorded for the opposite stack.
-    try await database.write { db in
-      // Fetch inverse SQL rows in reverse order (highest seq first = undo in LIFO order).
-      let rows = try UndoLog
-        .where { $0.seq >= entry.begin && $0.seq <= entry.end }
-        .order { $0.seq.desc() }
-        .fetchAll(db)
+    let affectedRows = try await $_isUndoingOrRedoing.withValue(true) {
+      try await database.write { db in
+        // Fetch inverse SQL rows in reverse order (highest seq first = undo in LIFO order).
+        let rows = try UndoLog
+          .where { $0.seq >= entry.begin && $0.seq <= entry.end }
+          .order { $0.seq.desc() }
+          .fetchAll(db)
 
-      // Remove these rows from the log before executing so re-entrant calls don't see them.
-      try UndoLog
-        .where { $0.seq >= entry.begin && $0.seq <= entry.end }
-        .delete()
-        .execute(db)
+        let affectedRows = Set(
+          rows
+            .filter { $0.trackedRowID != 0 }
+            .map { UndoAffectedRow(tableName: $0.tableName, rowID: $0.trackedRowID) }
+        )
 
-      // Execute each inverse SQL statement in order.
-      for row in rows {
-        try db.execute(sql: row.sql)
+        // Remove these rows from the log before executing so re-entrant calls don't see them.
+        try UndoLog
+          .where { $0.seq >= entry.begin && $0.seq <= entry.end }
+          .delete()
+          .execute(db)
+
+        // Execute each inverse SQL statement in order.
+        for row in rows {
+          try db.execute(sql: row.sql)
+        }
+        return affectedRows
       }
     }
 
     // The triggers fired during `applyInverse` will have added new rows to the log.
-    let newEnd = try await database.write { db in
-      try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
+    let newEnd = try await database.write { db -> Int in
+      guard var newEnd = try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq else { return 0 }
+      if newEnd >= firstLog {
+        try undoReconcileEntries(in: db, from: firstLog, to: newEnd)
+        newEnd = try UndoLog.order { $0.seq.desc() }.fetchOne(db)?.seq ?? 0
+      }
+      return newEnd
     }
     let didAppend = newEnd >= firstLog
 
@@ -446,6 +604,18 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
     }
 
     guard didAppend else { return }
+    let eventKind: UndoEvent.Kind
+    switch action {
+    case .undo: eventKind = .undo
+    case .redo: eventKind = .redo
+    }
+    eventsContinuation.yield(
+      UndoEvent(
+        kind: eventKind,
+        group: entry.group,
+        affectedRows: affectedRows
+      )
+    )
   }
 
   #if canImport(ObjectiveC)

@@ -8,6 +8,10 @@ package struct UndoLog {
 
   /// Auto-incremented sequence number (the SQLite rowid alias).
   package let seq: Int
+  /// The table name whose row change produced this inverse SQL entry.
+  package let tableName: String
+  /// The affected rowid in `tableName`.
+  package let trackedRowID: Int
   /// A SQL statement that inverts the original change.
   package let sql: String
 }

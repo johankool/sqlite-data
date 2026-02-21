@@ -1,7 +1,7 @@
 import Foundation
 
 /// A named group of database changes that can be undone or redone as a single unit.
-public struct UndoGroup: Sendable, Identifiable {
+public struct UndoGroup: Sendable, Identifiable, Equatable {
   /// A unique identifier for this group.
   public let id: UUID
   /// A human-readable description of the change, e.g. "Add reminder".

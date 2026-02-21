@@ -38,6 +38,8 @@ package func undoColumnNames(for tableName: String, in db: Database) throws -> [
 package let undoLogTableSQL = """
   CREATE TEMP TABLE IF NOT EXISTS "sqlitedata_undo_log" (
     "seq" INTEGER PRIMARY KEY AUTOINCREMENT,
+    "tableName" TEXT NOT NULL,
+    "trackedRowID" INTEGER NOT NULL DEFAULT 0,
     "sql" TEXT NOT NULL
   )
   """
@@ -64,6 +66,8 @@ package func undoTriggerSQL(for tableName: String, columns: [String]) -> [String
     BEGIN
       INSERT INTO \(logTable) VALUES(
         NULL,
+        '\(tableName)',
+        NEW.rowid,
         'DELETE FROM \(qt) WHERE rowid='||NEW.rowid
       );
     END
@@ -85,11 +89,13 @@ package func undoTriggerSQL(for tableName: String, columns: [String]) -> [String
     .joined(separator: ",")
   let updateTrigger = """
     CREATE TEMP TRIGGER \(undoDoubleQuotedIdentifier("\(triggerPrefix)update_\(tableName)"))
-    AFTER UPDATE ON \(qt)
+    BEFORE UPDATE ON \(qt)
     WHEN \(whenClause.dropFirst("WHEN ".count)) AND (\(changedCondition))
     BEGIN
       INSERT INTO \(logTable) VALUES(
         NULL,
+        '\(tableName)',
+        OLD.rowid,
         'UPDATE \(qt) SET \(setClause) WHERE rowid='||OLD.rowid
       );
     END
@@ -107,6 +113,8 @@ package func undoTriggerSQL(for tableName: String, columns: [String]) -> [String
     BEGIN
       INSERT INTO \(logTable) VALUES(
         NULL,
+        '\(tableName)',
+        OLD.rowid,
         'INSERT INTO \(qt)(rowid,\(colList)) VALUES('||OLD.rowid||',\(valList))'
       );
     END
@@ -121,6 +129,63 @@ package func undoTriggerDropSQL(for tableName: String) -> [String] {
   return ["insert", "update", "delete"].map { kind in
     "DROP TEMP TRIGGER IF EXISTS \(undoDoubleQuotedIdentifier("\(prefix)\(kind)_\(tableName)"))"
   }
+}
+
+// MARK: - Undo log analysis
+
+package func undoModifiedTableNames(in db: Database, from startSeq: Int, to endSeq: Int) throws -> Set<String> {
+  Set(
+    try String.fetchAll(
+      db,
+      sql: """
+        SELECT DISTINCT "tableName"
+        FROM "sqlitedata_undo_log"
+        WHERE "seq" >= ? AND "seq" <= ?
+        """,
+      arguments: [startSeq, endSeq]
+    )
+  )
+}
+
+package func undoReconcileEntries(in db: Database, from startSeq: Int, to endSeq: Int) throws {
+  let entries = try UndoLog
+    .where { $0.seq >= startSeq && $0.seq <= endSeq }
+    .order { $0.seq.asc() }
+    .fetchAll(db)
+
+  var grouped = [String: [UndoLog]]()
+  for entry in entries where entry.trackedRowID != 0 {
+    grouped["\(entry.tableName):\(entry.trackedRowID)", default: []].append(entry)
+  }
+
+  var seqsToDelete: [Int] = []
+  for (_, group) in grouped where group.count > 1 {
+    let first = group[0]
+    let last = group[group.count - 1]
+
+    let firstIsDeleteReverse = first.sql.uppercased().hasPrefix("DELETE FROM")
+    let lastIsInsertReverse = last.sql.uppercased().hasPrefix("INSERT INTO")
+
+    if firstIsDeleteReverse && lastIsInsertReverse {
+      seqsToDelete.append(contentsOf: group.map(\.seq))
+      continue
+    }
+
+    if firstIsDeleteReverse {
+      seqsToDelete.append(contentsOf: group.dropFirst().map(\.seq))
+      continue
+    }
+
+    seqsToDelete.append(
+      contentsOf: group.dropFirst().compactMap {
+        $0.sql.uppercased().hasPrefix("UPDATE") ? $0.seq : nil
+      }
+    )
+  }
+
+  guard !seqsToDelete.isEmpty else { return }
+  let sqlList = seqsToDelete.map(String.init).joined(separator: ",")
+  try db.execute(sql: "DELETE FROM \"sqlitedata_undo_log\" WHERE \"seq\" IN (\(sqlList))")
 }
 
 // MARK: - Helpers

@@ -18,6 +18,11 @@ import Testing
   var body: String?
 }
 
+@Table("audits") private struct Audit: Equatable, Identifiable {
+  let id: Int
+  var message: String
+}
+
 // MARK: - Database helpers
 
 extension DatabaseWriter where Self == DatabaseQueue {
@@ -186,6 +191,152 @@ extension DatabaseWriter where Self == DatabaseQueue {
   }
 
   // 8. When the delegate does not call performAction, the undo is cancelled.
+  @Test func explicitBarrierLifecycle() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+
+    let barrierID = try undoManager.beginBarrier("Insert via barrier")
+    try await db.write { db in
+      _ = try Item.insert { Item.Draft(title: "Barrier item") }.execute(db)
+    }
+    let group = try await undoManager.endBarrier(barrierID)
+
+    #expect(group?.description == "Insert via barrier")
+    #expect(undoManager.undoStack.count == 1)
+
+    try await undoManager.undo()
+    let items = try await db.read { try Item.fetchAll($0) }
+    #expect(items.isEmpty)
+  }
+
+  @Test func cancelBarrierDropsUndoRegistration() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+
+    let barrierID = try undoManager.beginBarrier("Cancelled barrier")
+    try await db.write { db in
+      _ = try Item.insert { Item.Draft(title: "Not undoable") }.execute(db)
+    }
+    try await undoManager.cancelBarrier(barrierID)
+
+    #expect(undoManager.undoStack.isEmpty)
+    let items = try await db.read { try Item.fetchAll($0) }
+    #expect(items.count == 1)
+  }
+
+  @Test func withoutUndoSuppressesRecording() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+
+    try await withoutUndo {
+      try await undoManager.withGroup("Suppressed insert") { db in
+        _ = try Item.insert { Item.Draft(title: "Suppressed") }.execute(db)
+      }
+    }
+
+    #expect(undoManager.undoStack.isEmpty)
+    let items = try await db.read { try Item.fetchAll($0) }
+    #expect(items.count == 1)
+  }
+
+  @Test func replayFunctionSuppressesAppTriggersDuringUndo() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+
+    try await db.write { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE "audit_log" (
+            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+            "message" TEXT NOT NULL
+          )
+          """
+      )
+      try db.execute(
+        sql: """
+          CREATE TEMP TRIGGER "item_delete_audit"
+          AFTER DELETE ON "items"
+          WHEN NOT "sqlitedata_undo_isReplaying"()
+          BEGIN
+            INSERT INTO "audit_log" ("message") VALUES ('delete ' || OLD."title");
+          END
+          """
+      )
+    }
+
+    try await undoManager.withGroup("Insert") { db in
+      _ = try Item.insert { Item.Draft(title: "Guarded") }.execute(db)
+    }
+    try await undoManager.undo()
+
+    let auditCount = try await db.read { db in
+      try Int.fetchOne(db, sql: #"SELECT COUNT(*) FROM "audit_log""#) ?? 0
+    }
+    #expect(auditCount == 0)
+  }
+
+  @Test func undoEventEmittedAfterUndo() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+    var iterator = undoManager.events.makeAsyncIterator()
+
+    try await undoManager.withGroup("Insert event") { db in
+      _ = try Item.insert { Item.Draft(title: "Event item") }.execute(db)
+    }
+    try await undoManager.undo()
+
+    let event = await iterator.next()
+    #expect(event?.kind == .undo)
+    #expect(event?.group.description == "Insert event")
+    #expect(event?.ids(for: Item.self) == [1])
+  }
+
+  @Test func noOpGroupIsReconciledAway() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+
+    try await undoManager.withGroup("Insert then delete") { db in
+      try db.execute(sql: #"INSERT INTO "items" ("title") VALUES ('Temp')"#)
+      let id = db.lastInsertedRowID
+      try db.execute(sql: #"DELETE FROM "items" WHERE "id" = ?"#, arguments: [id])
+    }
+
+    #expect(undoManager.undoStack.isEmpty)
+    let count = try await db.read { db in
+      try Int.fetchOne(db, sql: #"SELECT COUNT(*) FROM "items""#) ?? 0
+    }
+    #expect(count == 0)
+  }
+
+  @Test func warnsOnUnexpectedTrackedTableNames() async throws {
+    let db = try DatabaseQueue.undoDatabase()
+    let undoManager = try UndoManager(for: db, tables: Item.self)
+
+    try await db.write { db in
+      try db.execute(
+        sql: """
+          CREATE TABLE "audits" (
+            "id" INTEGER PRIMARY KEY AUTOINCREMENT,
+            "message" TEXT NOT NULL DEFAULT ''
+          )
+          """
+      )
+      let columns = try undoColumnNames(for: "audits", in: db)
+      for sql in undoTriggerSQL(for: "audits", columns: columns) {
+        try db.execute(sql: sql)
+      }
+    }
+
+    try await withKnownIssue {
+      try await undoManager.withGroup("Mixed tracked tables") { db in
+        _ = try Item.insert { Item.Draft(title: "Item") }.execute(db)
+        _ = try Audit.insert { Audit.Draft(message: "Audit") }.execute(db)
+      }
+    } matching: { issue in
+      issue.description.contains("unexpected tables: audits")
+    }
+  }
+
   @Test func delegateCancel() async throws {
     final class CancelDelegate: UndoManagerDelegate {
       func undoManager(
