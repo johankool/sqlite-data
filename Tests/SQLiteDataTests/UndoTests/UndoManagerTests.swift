@@ -13,10 +13,15 @@ import Testing
   var title: String
 }
 
+@Table("notes") private struct Note: Equatable, Identifiable {
+  let id: Int
+  var body: String?
+}
+
 // MARK: - Database helpers
 
 extension DatabaseWriter where Self == DatabaseQueue {
-  fileprivate static func undoDatabase(tableNames: [String] = ["items"]) throws -> DatabaseQueue {
+  fileprivate static func undoDatabase() throws -> DatabaseQueue {
     let database = try DatabaseQueue()
     var migrator = DatabaseMigrator()
     migrator.registerMigration("Create items") { db in
@@ -47,7 +52,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 1. Basic undo removes the inserted row and leaves canUndo false.
   @Test func basicUndo() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.withGroup("Insert") { db in
       _ = try Item.insert { Item.Draft(title: "Hello") }.execute(db)
@@ -66,7 +71,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 2. After undo, redo restores the row and leaves canRedo false.
   @Test func basicRedo() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.withGroup("Insert") { db in
       _ = try Item.insert { Item.Draft(title: "Hello") }.execute(db)
@@ -86,7 +91,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 3. Two inserts in one withGroup are undone together.
   @Test func undoGroup() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.withGroup("Batch insert") { db in
       _ = try Item.insert { Item.Draft(title: "A") }.execute(db)
@@ -103,7 +108,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 4. Separate groups produce separate undo entries; undoing removes only the last one.
   @Test func multipleGroups() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.withGroup("Insert A") { db in
       _ = try Item.insert { Item.Draft(title: "A") }.execute(db)
@@ -124,7 +129,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 5. Sync-origin writes can be grouped, undone, and carry synced-origin metadata.
   @Test func syncIncludedWithMetadata() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await $_isSynchronizingChanges.withValue(true) {
       try await undoManager.withGroup(
@@ -148,7 +153,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 6. Inverse SQL executed during undo is not added to the undo stack; it goes to redo.
   @Test func undoingNotRecorded() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.withGroup("Insert") { db in
       _ = try Item.insert { Item.Draft(title: "X") }.execute(db)
@@ -163,7 +168,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 7. Changes made while frozen are not undoable.
   @Test func freeze() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.freeze()
     // Direct write (not through withGroup) so we can test the trigger suppression via freeze.
@@ -195,7 +200,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
 
     let db = try DatabaseQueue.undoDatabase()
     let delegate = CancelDelegate()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"], delegate: delegate)
+    let undoManager = try UndoManager(for: db, tables: Item.self, delegate: delegate)
 
     try await undoManager.withGroup("Insert") { db in
       _ = try Item.insert { Item.Draft(title: "Persistent") }.execute(db)
@@ -236,7 +241,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
     let delegate = MetadataDelegate(capture)
     let undoManager = try UndoManager(
       for: db,
-      tableNames: ["items"],
+      tables: Item.self,
       deviceID: "test-device",
       delegate: delegate
     )
@@ -275,7 +280,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
 
     let db = try DatabaseQueue.undoDatabase()
     let delegate = ActionDelegate(capture)
-    let undoManager = try UndoManager(for: db, tableNames: ["items"], delegate: delegate)
+    let undoManager = try UndoManager(for: db, tables: Item.self, delegate: delegate)
 
     try await undoManager.withGroup("Insert") { db in
       _ = try Item.insert { Item.Draft(title: "Z") }.execute(db)
@@ -290,7 +295,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 11. The description from withGroup appears in undoStack.
   @Test func undoDescriptionRoundtrip() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.withGroup("Delete all items") { db in
       _ = try Item.insert { Item.Draft(title: "Temp") }.execute(db)
@@ -302,7 +307,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
   // 12. Nested freeze calls require matching unfreeze calls before recording resumes.
   @Test func nestedFreezeRequiresMatchingUnfreeze() async throws {
     let db = try DatabaseQueue.undoDatabase()
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
 
     try await undoManager.freeze()
     try await undoManager.freeze()
@@ -340,7 +345,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
       try db.execute(sql: #"INSERT INTO "items" ("title") VALUES (?)"#, arguments: ["Before"])
       return db.lastInsertedRowID
     }
-    let undoManager = try UndoManager(for: db, tableNames: ["items"])
+    let undoManager = try UndoManager(for: db, tables: Item.self)
     let updatedTitle = #"O'Reilly "Book""#
 
     try await undoManager.withGroup("Quoted update") { db in
@@ -378,7 +383,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
       try db.execute(sql: #"INSERT INTO "notes" ("body") VALUES (NULL)"#)
       return db.lastInsertedRowID
     }
-    let undoManager = try UndoManager(for: db, tableNames: ["notes"])
+    let undoManager = try UndoManager(for: db, tables: Note.self)
 
     try await undoManager.withGroup("Delete null row") { db in
       try db.execute(sql: #"DELETE FROM "notes" WHERE "id" = ?"#, arguments: [id])
@@ -414,7 +419,7 @@ extension DatabaseWriter where Self == DatabaseQueue {
     @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)
     @Test func syncEngineWriteWrappedByUserDatabaseIsUndoable() async throws {
       let db = try DatabaseQueue.undoDatabase()
-      let undoManager = try UndoManager(for: db, tableNames: ["items"])
+      let undoManager = try UndoManager(for: db, tables: Item.self)
       let userDatabase = UserDatabase(database: db)
       let zoneID = CKRecordZone.ID(zoneName: "shared-zone", ownerName: "collaborator-user")
 

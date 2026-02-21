@@ -11,7 +11,7 @@ extension DependencyValues {
   ///   $0.defaultDatabase = try! appDatabase()
   ///   $0.defaultUndoManager = try! UndoManager(
   ///     for: $0.defaultDatabase,
-  ///     tableNames: ["items"]
+  ///     tables: Item.self
   ///   )
   /// }
   /// ```

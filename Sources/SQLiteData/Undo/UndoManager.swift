@@ -22,7 +22,7 @@ import StructuredQueriesCore
 /// ```swift
 /// let undoManager = try UndoManager(
 ///   for: database,
-///   tableNames: ["reminders", "remindersTags"],
+///   tables: Reminder.self, ReminderTag.self,
 ///   deviceID: UIDevice.current.identifierForVendor?.uuidString ?? ""
 /// )
 ///
@@ -115,14 +115,16 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
   ///
   /// - Parameters:
   ///   - database: The database to observe.
-  ///   - tableNames: The names of the tables whose changes should be undoable.
+  ///   - tables: The names of the tables whose changes should be undoable.
   ///   - deviceID: An identifier for this device shown in ``UndoGroup/deviceID``.
   ///     Defaults to the system device identifier.
   ///   - userRecordName: A closure returning the current user's iCloud record name, or `nil`.
   ///   - delegate: An optional delegate that can intercept and confirm undo/redo operations.
-  public init(
+  public init<
+    each T: PrimaryKeyedTable & _SendableMetatype
+  >(
     for database: any DatabaseWriter,
-    tableNames: [String],
+    tables: repeat (each T).Type,
     deviceID: String = UndoManager.defaultDeviceID,
     userRecordName: @Sendable @escaping () -> String? = { nil },
     delegate: (any UndoManagerDelegate)? = nil
@@ -140,7 +142,8 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
 
       try db.execute(sql: undoLogTableSQL)
 
-      for tableName in tableNames {
+      for table in repeat each tables {
+        let tableName = table.tableName
         let columns = try undoColumnNames(for: tableName, in: db)
         guard !columns.isEmpty else { continue }
         for sql in undoTriggerSQL(for: tableName, columns: columns) {
@@ -175,7 +178,7 @@ public final class UndoManager: Perceptible, @unchecked Sendable {
 
   // MARK: - Static helpers
 
-  /// A device identifier suitable for use with ``init(for:tableNames:deviceID:userRecordName:delegate:)``.
+  /// A device identifier suitable for use with ``init(for:tables:deviceID:userRecordName:delegate:)``.
   ///
   /// On iOS this is `UIDevice.identifierForVendor`; on macOS it is the machine's host name.
   public static var defaultDeviceID: String {

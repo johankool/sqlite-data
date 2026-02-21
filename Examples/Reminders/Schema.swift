@@ -123,7 +123,11 @@ extension DependencyValues {
     defaultDatabase = try Reminders.appDatabase()
     defaultUndoManager = try UndoManager(
       for: defaultDatabase,
-      tableNames: ["remindersLists", "remindersListAssets", "reminders", "tags", "remindersTags"],
+      tables: RemindersList.self,
+      RemindersListAsset.self,
+      Reminder.self,
+      Tag.self,
+      ReminderTag.self,
       delegate: undoManagerDelegate
     )
     defaultSyncEngine = try SyncEngine(
