@@ -18,7 +18,16 @@
     package func write<T: Sendable>(
       _ updates: @Sendable (Database) throws -> T
     ) async throws -> T {
-      try await database.write { db in
+      @Dependency(\.defaultUndoManager) var defaultUndoManager
+      let undoManager = UndoManager.manager(for: database, defaultUndoManager: defaultUndoManager)
+      if let undoManager {
+        return try await undoManager.writeSyncChanges { db in
+          try $_isSynchronizingChanges.withValue(true) {
+            try updates(db)
+          }
+        }
+      }
+      return try await database.write { db in
         try $_isSynchronizingChanges.withValue(true) {
           try updates(db)
         }
@@ -37,7 +46,16 @@
     package func write<T>(
       _ updates: (Database) throws -> T
     ) throws -> T {
-      try database.write { db in
+      @Dependency(\.defaultUndoManager) var defaultUndoManager
+      let undoManager = UndoManager.manager(for: database, defaultUndoManager: defaultUndoManager)
+      if let undoManager {
+        return try undoManager.writeSyncChanges { db in
+          try $_isSynchronizingChanges.withValue(true) {
+            try updates(db)
+          }
+        }
+      }
+      return try database.write { db in
         try $_isSynchronizingChanges.withValue(true) {
           try updates(db)
         }
