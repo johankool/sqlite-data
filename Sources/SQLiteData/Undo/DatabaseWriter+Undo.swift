@@ -1,6 +1,6 @@
 import Foundation
 #if canImport(SwiftUI)
-  import SwiftUI
+  public import SwiftUI
 #endif
 
 @available(iOS 17, macOS 14, tvOS 17, watchOS 10, *)

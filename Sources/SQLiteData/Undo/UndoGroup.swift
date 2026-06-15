@@ -1,4 +1,4 @@
-import Foundation
+public import Foundation
 
 /// A named group of database changes that can be undone or redone as a single unit.
 public struct UndoGroup: Sendable, Identifiable, Equatable {

@@ -1,11 +1,11 @@
 import ConcurrencyExtras
 import Dependencies
-import Foundation
+public import Foundation
 import GRDB
 import IssueReporting
-import Observation
+public import Observation
 #if canImport(SwiftUI)
-  import SwiftUI
+  public import SwiftUI
 #endif
 import StructuredQueriesCore
 
